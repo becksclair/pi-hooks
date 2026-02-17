@@ -234,10 +234,6 @@ Use bash to find files: find src -name "*.ts" -type f`,
     async execute(_toolCallId, params, onUpdateArg, ctxArg, signalArg) {
       const { signal, onUpdate, ctx } = normalizeExecuteArgs(onUpdateArg, ctxArg, signalArg);
       if (signal?.aborted) return cancelledToolResult();
-      if (onUpdate) {
-        onUpdate({ content: [{ type: "text", text: "Working..." }], details: { status: "working" } });
-      }
-
       const manager = getOrCreateManager(ctx.cwd);
       const { action, file, files, line, column, endLine, endColumn, query, newName, severity } = params as LspParamsType;
       const sevFilter: SeverityFilter = severity || "all";
@@ -352,7 +348,7 @@ Use bash to find files: find src -name "*.ts" -type f`,
     },
 
     renderResult(result, options, theme) {
-      if (options.isPartial) return new Text(theme.fg("warning", "Working..."), 0, 0);
+      if (options.isPartial) return new Text("", 0, 0);
 
       const textContent = (result.content?.find((c: any) => c.type === "text") as any)?.text || "";
       const lines = textContent.split("\n");
