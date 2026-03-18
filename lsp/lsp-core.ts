@@ -1127,3 +1127,26 @@ export async function resolvePosition(manager: LSPManager, file: string, query: 
   const pos = findSymbolPosition(symbols, query);
   return pos ? { line: pos.line + 1, column: pos.character + 1 } : null;
 }
+
+/**
+ * Format a list of document symbols into display lines.
+ *
+ * Uses `selectionRange` (the identifier's own range) rather than `range` (the
+ * full declaration span) so that the reported line:column points at the symbol
+ * name itself — the position that hover, definition, and references requests
+ * all expect.  Falls back to `range` for servers that omit `selectionRange`.
+ */
+export function collectSymbols(symbols: DocumentSymbol[], depth = 0, lines: string[] = [], query?: string): string[] {
+  for (const sym of symbols) {
+    const name = (sym as any)?.name ?? "<unknown>";
+    if (query && !name.toLowerCase().includes(query.toLowerCase())) {
+      if ((sym as any).children?.length) collectSymbols((sym as any).children, depth + 1, lines, query);
+      continue;
+    }
+    const startPos = sym?.selectionRange?.start ?? sym?.range?.start;
+    const loc = startPos ? `${startPos.line + 1}:${startPos.character + 1}` : "";
+    lines.push(`${"  ".repeat(depth)}${name}${loc ? ` (${loc})` : ""}`);
+    if ((sym as any).children?.length) collectSymbols((sym as any).children, depth + 1, lines, query);
+  }
+  return lines;
+}
