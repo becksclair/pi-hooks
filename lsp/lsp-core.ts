@@ -1563,6 +1563,10 @@ export class LSPManager {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
+    // Drain any in-flight spawns so they don't re-add to this.clients after we clear it.
+    const inFlight = Array.from(this.spawning.values());
+    this.spawning.clear();
+    await Promise.allSettled(inFlight);
     const clients = Array.from(this.clients.values());
     this.clients.clear();
     for (const client of clients) {
@@ -1573,7 +1577,15 @@ export class LSPManager {
           await Promise.race([client.connection.sendRequest("shutdown"), new Promise((resolve) => setTimeout(resolve, 1000))]);
         } catch {}
         try {
-          void client.connection.sendNotification("exit").catch(() => {});
+          // Await the exit notification (with a short timeout) so that
+          // vscode-jsonrpc's internal write queue can flush before we destroy
+          // the underlying stream via connection.end().  Firing-and-forgetting
+          // here races with the synchronous connection.end() call below and
+          // produces an ERR_STREAM_DESTROYED unhandled rejection.
+          await Promise.race([
+            client.connection.sendNotification("exit"),
+            new Promise<void>((resolve) => setTimeout(resolve, 200)),
+          ]);
         } catch {}
       }
       try {
