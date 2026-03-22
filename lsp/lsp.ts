@@ -3,12 +3,6 @@
  *
  * Provides automatic diagnostics feedback (default: agent end).
  * Can run after each write/edit or once per agent response.
- *
- * Usage:
- *   pi --extension ./lsp.ts
- *
- * Or load the directory to get both hook and tool:
- *   pi --extension ./lsp/
  */
 
 import * as path from "node:path";
@@ -17,20 +11,20 @@ import * as os from "node:os";
 import { type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { type Diagnostic } from "vscode-languageserver-protocol";
-import { LSP_SERVERS, formatDiagnostic, getOrCreateManager, shutdownManager } from "./lsp-core.js";
+import {
+  type HookMode,
+  formatDiagnostic,
+  getOrCreateManager,
+  getResolvedServerForFile,
+  normalizeHookMode,
+  resolveLspConfig,
+  shutdownManager,
+} from "./lsp-core.js";
 
 type HookScope = "session" | "global";
-type HookMode = "edit_write" | "agent_end" | "disabled";
+type LspActivity = "idle" | "loading" | "working";
 
 const DIAGNOSTICS_WAIT_MS_DEFAULT = 3000;
-
-function diagnosticsWaitMsForFile(filePath: string): number {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".kt" || ext === ".kts") return 30000;
-  if (ext === ".swift") return 20000;
-  if (ext === ".rs") return 20000;
-  return DIAGNOSTICS_WAIT_MS_DEFAULT;
-}
 const DIAGNOSTICS_PREVIEW_LINES = 10;
 const LSP_IDLE_SHUTDOWN_MS = 2 * 60 * 1000;
 const DIM = "\x1b[2m", GREEN = "\x1b[32m", YELLOW = "\x1b[33m", RESET = "\x1b[0m";
@@ -60,10 +54,12 @@ const MODE_LABELS: Record<HookMode, string> = {
   disabled: "Disabled",
 };
 
-function normalizeHookMode(value: unknown): HookMode | undefined {
-  if (value === "edit_write" || value === "agent_end" || value === "disabled") return value;
-  if (value === "turn_end") return "agent_end";
-  return undefined;
+function diagnosticsWaitMsForFile(filePath: string): number {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === ".kt" || ext === ".kts") return 30000;
+  if (ext === ".swift") return 20000;
+  if (ext === ".rs") return 20000;
+  return DIAGNOSTICS_WAIT_MS_DEFAULT;
 }
 
 interface HookConfigEntry {
@@ -72,9 +68,7 @@ interface HookConfigEntry {
 }
 
 export default function (pi: ExtensionAPI) {
-  type LspActivity = "idle" | "loading" | "working";
-
-  let activeClients: Set<string> = new Set();
+  let activeClients = new Set<string>();
   let statusUpdateFn: ((key: string, text: string | undefined) => void) | null = null;
   let hookMode: HookMode = DEFAULT_HOOK_MODE;
   let hookScope: HookScope = "global";
@@ -83,7 +77,7 @@ export default function (pi: ExtensionAPI) {
   let shuttingDown = false;
   let idleShutdownTimer: NodeJS.Timeout | null = null;
 
-  const touchedFiles: Map<string, boolean> = new Map();
+  const touchedFiles = new Map<string, boolean>();
   const globalSettingsPath = path.join(os.homedir(), ".pi", "agent", "settings.json");
 
   function readSettingsFile(filePath: string): Record<string, unknown> {
@@ -95,18 +89,6 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return {};
     }
-  }
-
-  function getGlobalHookMode(): HookMode | undefined {
-    const settings = readSettingsFile(globalSettingsPath);
-    const lspSettings = settings[SETTINGS_NAMESPACE];
-    const hookValue = (lspSettings as { hookMode?: unknown; hookEnabled?: unknown } | undefined)?.hookMode;
-    const normalized = normalizeHookMode(hookValue);
-    if (normalized) return normalized;
-
-    const legacyEnabled = (lspSettings as { hookEnabled?: unknown } | undefined)?.hookEnabled;
-    if (typeof legacyEnabled === "boolean") return legacyEnabled ? "edit_write" : "disabled";
-    return undefined;
   }
 
   function setGlobalHookMode(mode: HookMode): boolean {
@@ -157,8 +139,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    const globalSetting = getGlobalHookMode();
-    hookMode = globalSetting ?? DEFAULT_HOOK_MODE;
+    hookMode = resolveLspConfig(ctx.cwd).hookMode ?? DEFAULT_HOOK_MODE;
     hookScope = "global";
   }
 
@@ -174,8 +155,8 @@ export default function (pi: ExtensionAPI) {
     if (typeof content === "string") return content;
     if (Array.isArray(content)) {
       return content
-        .map((item) => (item && typeof item === "object" && "type" in item && (item as any).type === "text")
-          ? String((item as any).text ?? "")
+        .map((item) => (item && typeof item === "object" && "type" in item && (item as { type?: unknown; text?: unknown }).type === "text")
+          ? String((item as { text?: unknown }).text ?? "")
           : "")
         .filter(Boolean)
         .join("\n");
@@ -221,7 +202,7 @@ export default function (pi: ExtensionAPI) {
       void shutdownLspServersForIdle();
     }, LSP_IDLE_SHUTDOWN_MS);
 
-    (idleShutdownTimer as any).unref?.();
+    (idleShutdownTimer as { unref?: () => void }).unref?.();
   }
 
   function updateLspStatus(): void {
@@ -264,41 +245,36 @@ export default function (pi: ExtensionAPI) {
       return theme.fg("toolOutput", line);
     });
 
-    if (!expanded && remaining > 0) {
-      styledLines.push(theme.fg("dim", `... (${remaining} more lines)`));
-    }
-
+    if (!expanded && remaining > 0) styledLines.push(theme.fg("dim", `... (${remaining} more lines)`));
     return new Text(styledLines.join("\n"), 0, 0);
   });
 
-  function getServerConfig(filePath: string) {
-    const ext = path.extname(filePath);
-    return LSP_SERVERS.find((s) => s.extensions.includes(ext));
-  }
-
   function ensureActiveClientForFile(filePath: string, cwd: string): string | undefined {
     const absPath = normalizeFilePath(filePath, cwd);
-    const cfg = getServerConfig(absPath);
-    if (!cfg) return undefined;
+    const resolved = resolveLspConfig(cwd);
+    const servers = getResolvedServerForFile(absPath, cwd, resolved);
+    if (servers.length === 0) return undefined;
 
-    if (!activeClients.has(cfg.id)) {
-      activeClients.add(cfg.id);
-      updateLspStatus();
+    let changed = false;
+    for (const server of servers) {
+      if (!activeClients.has(server.id)) {
+        activeClients.add(server.id);
+        changed = true;
+      }
     }
+    if (changed) updateLspStatus();
 
     return absPath;
   }
 
   function extractLspFiles(input: Record<string, unknown>): string[] {
     const files: string[] = [];
-
     if (typeof input.file === "string") files.push(input.file);
     if (Array.isArray(input.files)) {
       for (const item of input.files) {
         if (typeof item === "string") files.push(item);
       }
     }
-
     return files;
   }
 
@@ -310,16 +286,16 @@ export default function (pi: ExtensionAPI) {
   ): { notification: string; errorCount: number; output: string } {
     const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
     const relativePath = path.relative(cwd, absPath);
-    const errorCount = diagnostics.filter((e) => e.severity === 1).length;
+    const errorCount = diagnostics.filter((diagnostic) => diagnostic.severity === 1).length;
 
-    const MAX = 5;
-    const lines = diagnostics.slice(0, MAX).map((e) => {
-      const sev = e.severity === 1 ? "ERROR" : "WARN";
-      return `${sev}[${e.range.start.line + 1}] ${e.message.split("\n")[0]}`;
+    const maxPreview = 5;
+    const lines = diagnostics.slice(0, maxPreview).map((diagnostic) => {
+      const sev = diagnostic.severity === 1 ? "ERROR" : "WARN";
+      return `${sev}[${diagnostic.range.start.line + 1}] ${diagnostic.message.split("\n")[0]}`;
     });
 
     let notification = `📋 ${relativePath}\n${lines.join("\n")}`;
-    if (diagnostics.length > MAX) notification += `\n... +${diagnostics.length - MAX} more`;
+    if (diagnostics.length > maxPreview) notification += `\n... +${diagnostics.length - maxPreview} more`;
 
     const header = includeFileHeader ? `File: ${relativePath}\n` : "";
     const output = `\n${header}This file has errors, please fix\n<file_diagnostics>\n${diagnostics.map(formatDiagnostic).join("\n")}\n</file_diagnostics>\n`;
@@ -344,7 +320,7 @@ export default function (pi: ExtensionAPI) {
 
       const diagnostics = includeWarnings
         ? result.diagnostics
-        : result.diagnostics.filter((d) => d.severity === 1);
+        : result.diagnostics.filter((diagnostic) => diagnostic.severity === 1);
       if (!diagnostics.length) return undefined;
 
       const report = buildDiagnosticsOutput(filePath, diagnostics, ctx.cwd, includeFileHeader);
@@ -369,11 +345,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const currentMark = " ✓";
-      const modeOptions = ([
-        "edit_write",
-        "agent_end",
-        "disabled",
-      ] as HookMode[]).map((mode) => ({
+      const modeOptions = (["edit_write", "agent_end", "disabled"] as HookMode[]).map((mode) => ({
         mode,
         label: mode === hookMode ? `${labelForMode(mode)}${currentMark}` : labelForMode(mode),
       }));
@@ -388,14 +360,8 @@ export default function (pi: ExtensionAPI) {
       if (!nextMode) return;
 
       const scopeOptions = [
-        {
-          scope: "session" as HookScope,
-          label: "Session only",
-        },
-        {
-          scope: "global" as HookScope,
-          label: "Global (all sessions)",
-        },
+        { scope: "session" as HookScope, label: "Session only" },
+        { scope: "global" as HookScope, label: "Global (all sessions)" },
       ];
 
       const scopeChoice = await ctx.ui.select(
@@ -406,6 +372,7 @@ export default function (pi: ExtensionAPI) {
 
       const scope = scopeOptions.find((option) => option.label === scopeChoice)?.scope;
       if (!scope) return;
+
       if (scope === "global") {
         const ok = setGlobalHookMode(nextMode);
         if (!ok) {
@@ -431,21 +398,25 @@ export default function (pi: ExtensionAPI) {
     if (hookMode === "disabled") return;
 
     const manager = getOrCreateManager(ctx.cwd);
+    const resolved = resolveLspConfig(ctx.cwd);
 
     for (const [marker, ext] of Object.entries(WARMUP_MAP)) {
-      if (fs.existsSync(path.join(ctx.cwd, marker))) {
-        setActivity("loading");
-        manager.getClientsForFile(path.join(ctx.cwd, `dummy${ext}`))
-          .then((clients) => {
-            if (clients.length > 0) {
-              const cfg = LSP_SERVERS.find((s) => s.extensions.includes(ext));
-              if (cfg) activeClients.add(cfg.id);
-            }
-          })
-          .catch(() => {})
-          .finally(() => setActivity("idle"));
-        break;
-      }
+      if (!fs.existsSync(path.join(ctx.cwd, marker))) continue;
+
+      const warmupFile = path.join(ctx.cwd, `__pi_lsp_warmup__${ext}`);
+      const matching = getResolvedServerForFile(warmupFile, ctx.cwd, resolved);
+      if (matching.length === 0) continue;
+
+      setActivity("loading");
+      manager.getClientsForFile(warmupFile)
+        .then((clients) => {
+          if (clients.length > 0) {
+            for (const server of matching) activeClients.add(server.id);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setActivity("idle"));
+      break;
     }
   });
 
@@ -484,9 +455,7 @@ export default function (pi: ExtensionAPI) {
     if (event.toolName === "lsp") {
       clearIdleShutdownTimer();
       const files = extractLspFiles(input);
-      for (const file of files) {
-        ensureActiveClientForFile(file, ctx.cwd);
-      }
+      for (const file of files) ensureActiveClientForFile(file, ctx.cwd);
       return;
     }
 
@@ -510,26 +479,25 @@ export default function (pi: ExtensionAPI) {
     touchedFiles.clear();
   });
 
-  function agentWasAborted(event: any): boolean {
-    const messages = Array.isArray(event?.messages) ? event.messages : [];
-    return messages.some((m: any) =>
-      m &&
-      typeof m === "object" &&
-      (m as any).role === "assistant" &&
-      (((m as any).stopReason === "aborted") || ((m as any).stopReason === "error"))
-    );
+  function agentWasAborted(event: unknown): boolean {
+    const messages = Array.isArray((event as { messages?: unknown[] } | undefined)?.messages)
+      ? (event as { messages: unknown[] }).messages
+      : [];
+
+    return messages.some((message) => {
+      if (!message || typeof message !== "object") return false;
+      const candidate = message as { role?: unknown; stopReason?: unknown };
+      return candidate.role === "assistant" && (candidate.stopReason === "aborted" || candidate.stopReason === "error");
+    });
   }
 
   pi.on("agent_end", async (event, ctx) => {
     try {
       if (hookMode !== "agent_end") return;
-
       if (agentWasAborted(event)) {
-        // Don't run diagnostics on aborted/error runs.
         touchedFiles.clear();
         return;
       }
-
       if (touchedFiles.size === 0) return;
       if (!ctx.isIdle() || ctx.hasPendingMessages()) return;
 
@@ -537,7 +505,6 @@ export default function (pi: ExtensionAPI) {
       diagnosticsAbort?.abort();
       diagnosticsAbort = abort;
 
-      // Avoid showing a transient "working" state during agent-end diagnostics.
       const files = Array.from(touchedFiles.entries());
       touchedFiles.clear();
 
@@ -556,7 +523,6 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (shuttingDown || abort.signal.aborted) return;
-
         if (outputs.length) {
           pi.sendMessage({
             customType: "lsp-diagnostics",
@@ -579,12 +545,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_result", async (event, ctx) => {
     if (event.toolName !== "write" && event.toolName !== "edit") return;
 
-    const filePath = event.input.path as string;
+    const filePath = event.input.path as string | undefined;
     if (!filePath) return;
 
     const absPath = ensureActiveClientForFile(filePath, ctx.cwd);
     if (!absPath) return;
-
     if (hookMode === "disabled") return;
 
     if (hookMode === "agent_end") {
@@ -598,6 +563,8 @@ export default function (pi: ExtensionAPI) {
     const output = await collectDiagnostics(absPath, ctx, includeWarnings, false);
     if (!output) return;
 
-    return { content: [...event.content, { type: "text" as const, text: output }] as Array<{ type: "text"; text: string }> };
+    return {
+      content: [...event.content, { type: "text" as const, text: output }] as Array<{ type: "text"; text: string }>,
+    };
   });
 }

@@ -13,11 +13,13 @@ process.on('uncaughtException', (err) => {
   process.exit(1);
 });
 
-import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
+import { mkdtemp, rm, writeFile, mkdir, readFile, chmod } from "fs/promises";
 import { existsSync, statSync } from "fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "os";
-import { join, delimiter } from "path";
-import { LSPManager } from "../lsp-core.js";
+import { join, delimiter, dirname } from "path";
+import { fileURLToPath } from "url";
+import { LSPManager, resolveLspConfig } from "../lsp-core.js";
 
 // ============================================================================
 // Test utilities
@@ -64,6 +66,53 @@ function commandExists(cmd: string): boolean {
     } catch {}
   }
   return false;
+}
+
+function commandPath(cmd: string): string | undefined {
+  for (const dir of SEARCH_PATHS) {
+    const full = join(dir, cmd);
+    try {
+      if (existsSync(full) && statSync(full).isFile()) return full;
+    } catch {}
+  }
+  return undefined;
+}
+
+const TESTS_DIR = dirname(fileURLToPath(import.meta.url));
+const LSP_HOOK_EXTENSION = join(TESTS_DIR, "..", "lsp.ts");
+const LSP_TOOL_EXTENSION = join(TESTS_DIR, "..", "lsp-tool.ts");
+
+async function runPiPrintCommand(cwd: string, extensionPaths: string[], command: string, env?: Record<string, string>): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const piPath = commandPath("pi");
+  if (!piPath) skip("pi not installed");
+
+  return await new Promise((resolve, reject) => {
+    const args = ["--no-session", "--no-extensions", "-p"];
+    for (const extensionPath of extensionPaths) {
+      args.push("--extension", extensionPath);
+    }
+    args.push(command);
+
+    const proc = spawn(piPath, args, {
+      cwd,
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf-8");
+    });
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf-8");
+    });
+    proc.on("error", reject);
+    proc.on("close", (code) => {
+      resolve({ stdout, stderr, exitCode: code ?? 1 });
+    });
+  });
 }
 
 // ============================================================================
@@ -559,6 +608,369 @@ test("typescript: code actions for missing function", async () => {
     // Note: we don't assert on action count since it depends on TS version
   } finally {
     await manager.shutdown();
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// ============================================================================
+// Config-driven integration
+// ============================================================================
+
+test("config: built-in override keeps TypeScript extensions", async () => {
+  if (!commandExists("typescript-language-server")) {
+    skip("typescript-language-server not installed");
+  }
+
+  const originalHome = process.env.HOME;
+  const dir = await mkdtemp(join(tmpdir(), "lsp-ts-config-"));
+
+  try {
+    process.env.HOME = dir;
+    await mkdir(join(dir, ".pi", "agent"), { recursive: true });
+    await writeFile(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: { command: ["typescript-language-server", "--stdio"] },
+        },
+      },
+    }));
+
+    await writeFile(join(dir, "package.json"), "{}");
+    await writeFile(join(dir, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true, noEmit: true } }));
+    const file = join(dir, "index.tsx");
+    await writeFile(file, `const x: string = 123;`);
+
+    const resolved = resolveLspConfig(dir);
+    const manager = new LSPManager(dir, resolved.servers, resolved.fingerprint);
+
+    try {
+      const { diagnostics, receivedResponse } = await manager.touchFileAndWait(file, 10000);
+
+      assert(receivedResponse, "Expected TypeScript LSP to respond with overridden command");
+      assert(diagnostics.length > 0, "Expected diagnostics for TSX file using inherited built-in extensions");
+    } finally {
+      await manager.shutdown();
+    }
+  } finally {
+    process.env.HOME = originalHome;
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("config: built-in override preserves TypeScript findRoot behavior", async () => {
+  if (!commandExists("typescript-language-server")) {
+    skip("typescript-language-server not installed");
+  }
+
+  const originalHome = process.env.HOME;
+  const dir = await mkdtemp(join(tmpdir(), "lsp-ts-deno-config-"));
+
+  try {
+    process.env.HOME = dir;
+    await mkdir(join(dir, ".pi", "agent"), { recursive: true });
+    await writeFile(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: { command: ["typescript-language-server", "--stdio"] },
+        },
+      },
+    }));
+
+    const projectRoot = join(dir, "nested", "ts-project");
+    await mkdir(join(projectRoot, "src"), { recursive: true });
+    await writeFile(join(projectRoot, "deno.json"), JSON.stringify({ tasks: {} }, null, 2));
+
+    const file = join(projectRoot, "src", "index.ts");
+    await writeFile(file, "const x: string = 123;");
+
+    const resolved = resolveLspConfig(dir);
+    const typescript = resolved.servers.find((server) => server.id === "typescript");
+    assert(typescript !== undefined, "TypeScript server should resolve with builtin override");
+    assert(typescript.findRoot(file, dir) === undefined, "Deno marker should disable builtin TypeScript root detection");
+
+    const manager = new LSPManager(dir, resolved.servers, resolved.fingerprint);
+
+    try {
+      const result = await manager.touchFileAndWait(file, 4000);
+
+      assert(result.unsupported === true, "Deno project should remain unsupported when builtin root detection is preserved");
+    } finally {
+      await manager.shutdown();
+    }
+  } finally {
+    process.env.HOME = originalHome;
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("config: built-in disable makes Python unsupported", async () => {
+  const originalHome = process.env.HOME;
+  const dir = await mkdtemp(join(tmpdir(), "lsp-py-disabled-"));
+
+  try {
+    process.env.HOME = dir;
+    await mkdir(join(dir, ".pi", "agent"), { recursive: true });
+    await writeFile(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({
+      lsp: {
+        servers: {
+          pyright: { disabled: true },
+        },
+      },
+    }));
+
+    await writeFile(join(dir, "pyproject.toml"), `[project]\nname = "test"`);
+    const file = join(dir, "main.py");
+    await writeFile(file, `x: str = 123`);
+
+    const resolved = resolveLspConfig(dir);
+    const manager = new LSPManager(dir, resolved.servers, resolved.fingerprint);
+
+    try {
+      const result = await manager.touchFileAndWait(file, 2000);
+
+      assert(result.unsupported === true, "Disabled Pyright should leave Python unsupported");
+    } finally {
+      await manager.shutdown();
+    }
+  } finally {
+    process.env.HOME = originalHome;
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("config: initialization override is preserved in resolved server config", async () => {
+  const originalHome = process.env.HOME;
+  const dir = await mkdtemp(join(tmpdir(), "lsp-init-config-"));
+
+  try {
+    process.env.HOME = dir;
+    await mkdir(join(dir, ".pi", "agent"), { recursive: true });
+    await writeFile(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: {
+            initialization: { preferences: { includeCompletionsForModuleExports: true } },
+          },
+        },
+      },
+    }));
+
+    const resolved = resolveLspConfig(dir);
+    const typescript = resolved.servers.find((server) => server.id === "typescript");
+    assert(typescript !== undefined, "Expected TypeScript server to resolve");
+    assert((typescript?.initialization as any)?.preferences?.includeCompletionsForModuleExports === true, "Initialization config should survive resolution");
+  } finally {
+    process.env.HOME = originalHome;
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("config: custom server uses generic root and responds", async () => {
+  if (!commandExists("typescript-language-server")) {
+    skip("typescript-language-server not installed");
+  }
+
+  const originalHome = process.env.HOME;
+  const dir = await mkdtemp(join(tmpdir(), "lsp-custom-config-"));
+
+  try {
+    process.env.HOME = dir;
+    await mkdir(join(dir, ".pi", "agent"), { recursive: true });
+    await writeFile(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: { disabled: true },
+          "ts-custom": {
+            command: ["typescript-language-server", "--stdio"],
+            extensions: [".ts"],
+            initialization: { preferences: { includeCompletionsForModuleExports: true } },
+          },
+        },
+      },
+    }));
+
+    await mkdir(join(dir, "src"), { recursive: true });
+    const file = join(dir, "src", "index.ts");
+    await writeFile(file, `const x: string = 123;`);
+
+    const resolved = resolveLspConfig(dir);
+    const custom = resolved.servers.find((server) => server.id === "ts-custom");
+    assert(custom !== undefined, "Custom server should resolve");
+    assert(custom!.extensions.includes(".ts"), "Custom server should register .ts extension");
+    assert(custom!.findRoot(file, dir) === join(dir, "src"), "Generic root fallback should point to file directory");
+
+    const manager = new LSPManager(dir, resolved.servers, resolved.fingerprint);
+    try {
+      const result = await manager.touchFileAndWait(file, 12000);
+      assert(result.receivedResponse, "Custom server should respond for .ts file");
+      assert(result.unsupported !== true, "Custom server should support .ts in resolved config");
+      assert(result.diagnostics.length > 0, "Custom server should emit diagnostics for invalid TypeScript");
+    } finally {
+      await manager.shutdown();
+    }
+  } finally {
+    process.env.HOME = originalHome;
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test("pi process: configured TypeScript server override is used instead of builtin default", async () => {
+  if (!commandExists("pi")) {
+    skip("pi not installed");
+  }
+
+  const originalHome = process.env.HOME;
+  const dir = await mkdtemp(join(tmpdir(), "pi-lsp-e2e-"));
+  const binDir = join(dir, "bin");
+  const markerFile = join(dir, "server-spawns.log");
+  const resultFile = join(dir, "pi-result.json");
+  const fakeServerPath = join(dir, "fake-lsp-server.mjs");
+  const overrideServerPath = join(binDir, "ts-override-lsp");
+  const builtinServerPath = join(binDir, "typescript-language-server");
+  const testExtensionPath = join(dir, "pi-lsp-e2e-extension.ts");
+
+  const fakeServerSource = `
+import fs from "node:fs";
+const label = process.argv[2] || "unknown";
+const markerFile = process.argv[3];
+if (markerFile) fs.appendFileSync(markerFile, label + "\\n");
+let buffer = Buffer.alloc(0);
+function send(message) {
+  const json = JSON.stringify(message);
+  process.stdout.write(\`Content-Length: \${Buffer.byteLength(json, "utf8")}\\r\\n\\r\\n\${json}\`);
+}
+function publish(uri) {
+  send({
+    jsonrpc: "2.0",
+    method: "textDocument/publishDiagnostics",
+    params: {
+      uri,
+      diagnostics: [{
+        severity: 2,
+        range: {
+          start: { line: 0, character: 0 },
+          end: { line: 0, character: 1 }
+        },
+        message: label + " diagnostic"
+      }]
+    }
+  });
+}
+function handle(message) {
+  if (message.method === "initialize") {
+    send({ jsonrpc: "2.0", id: message.id, result: { capabilities: { textDocumentSync: 1 } } });
+    return;
+  }
+  if (message.method === "shutdown") {
+    send({ jsonrpc: "2.0", id: message.id, result: null });
+    return;
+  }
+  if (message.method === "exit") {
+    process.exit(0);
+  }
+  if (message.method === "textDocument/didOpen") {
+    publish(message.params.textDocument.uri);
+    return;
+  }
+  if (message.method === "textDocument/didChange" || message.method === "textDocument/didSave") {
+    publish(message.params.textDocument.uri);
+  }
+}
+function pump() {
+  while (true) {
+    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");
+    if (headerEnd === -1) return;
+    const header = buffer.slice(0, headerEnd).toString("utf8");
+    const match = /Content-Length: (\\d+)/i.exec(header);
+    if (!match) {
+      process.exit(1);
+    }
+    const length = Number(match[1]);
+    const frameEnd = headerEnd + 4 + length;
+    if (buffer.length < frameEnd) return;
+    const body = buffer.slice(headerEnd + 4, frameEnd).toString("utf8");
+    buffer = buffer.slice(frameEnd);
+    handle(JSON.parse(body));
+  }
+}
+process.stdin.on("data", (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  pump();
+});
+`;
+
+  const testExtensionSource = `
+import fs from "node:fs";
+import path from "node:path";
+import { getOrCreateManager } from ${JSON.stringify(fileURLToPath(new URL("../lsp-core.ts", import.meta.url)))};
+export default function (pi) {
+  pi.registerCommand("lsp-e2e-check", {
+    description: "Run Pi LSP end-to-end check",
+    handler: async (_args, ctx) => {
+      const file = path.join(ctx.cwd, "src", "index.ts");
+      const manager = getOrCreateManager(ctx.cwd);
+      const result = await manager.touchFileAndWait(file, 5000);
+      fs.writeFileSync(process.env.PI_LSP_E2E_RESULT, JSON.stringify({
+        receivedResponse: result.receivedResponse,
+        unsupported: result.unsupported === true,
+        diagnostics: result.diagnostics.map((d) => d.message),
+      }, null, 2), "utf8");
+    }
+  });
+}
+`;
+
+  try {
+    process.env.HOME = dir;
+    await mkdir(binDir, { recursive: true });
+    await mkdir(join(dir, ".pi", "agent"), { recursive: true });
+    await mkdir(join(dir, "src"), { recursive: true });
+
+    await writeFile(fakeServerPath, fakeServerSource, "utf8");
+    await writeFile(overrideServerPath, `#!/usr/bin/env bash\nexec node ${JSON.stringify(fakeServerPath)} override ${JSON.stringify(markerFile)}\n`, "utf8");
+    await writeFile(builtinServerPath, `#!/usr/bin/env bash\nexec node ${JSON.stringify(fakeServerPath)} builtin ${JSON.stringify(markerFile)}\n`, "utf8");
+    await chmod(overrideServerPath, 0o755);
+    await chmod(builtinServerPath, 0o755);
+
+    await writeFile(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({
+      lsp: {
+        hookMode: "disabled",
+        servers: {
+          typescript: {
+            command: ["ts-override-lsp"],
+          },
+        },
+      },
+    }, null, 2));
+
+    await writeFile(join(dir, "package.json"), "{}", "utf8");
+    await writeFile(join(dir, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true, noEmit: true } }, null, 2));
+    await writeFile(join(dir, "src", "index.ts"), "const x: string = 123;\n", "utf8");
+    await writeFile(testExtensionPath, testExtensionSource, "utf8");
+
+    const run = await runPiPrintCommand(
+      dir,
+      [LSP_HOOK_EXTENSION, LSP_TOOL_EXTENSION, testExtensionPath],
+      "/lsp-e2e-check",
+      {
+        PATH: `${binDir}${delimiter}${process.env.PATH || ""}`,
+        PI_LSP_E2E_RESULT: resultFile,
+      },
+    );
+
+    assert(run.exitCode === 0, `Expected pi command to succeed. stderr: ${run.stderr || "<empty>"}`);
+    assert(existsSync(resultFile), `Expected Pi command to write ${resultFile}. stdout: ${run.stdout} stderr: ${run.stderr}`);
+
+    const markers = (await readFile(markerFile, "utf8")).trim().split(/\r?\n/).filter(Boolean);
+    const result = JSON.parse(await readFile(resultFile, "utf8")) as { receivedResponse: boolean; unsupported: boolean; diagnostics: string[] };
+
+    assert(markers.includes("override"), `Expected configured override server to spawn. Markers: ${markers.join(", ")}`);
+    assert(!markers.includes("builtin"), `Expected builtin default server to stay unused. Markers: ${markers.join(", ")}`);
+    assert(result.receivedResponse, "Expected Pi-driven LSP request to receive a response");
+    assert(!result.unsupported, "Expected TypeScript file to be supported through configured override");
+    assert(result.diagnostics.some((message) => message.includes("override diagnostic")), `Expected diagnostics from override server, got: ${result.diagnostics.join(", ")}`);
+  } finally {
+    process.env.HOME = originalHome;
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 });

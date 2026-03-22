@@ -8,6 +8,7 @@ Language Server Protocol integration for pi-coding-agent.
 - **Tool** (`lsp-tool.ts`): On-demand LSP queries (definitions, references, hover, symbols, diagnostics, signatures)
 - Manages one LSP server per project root and reuses them across turns
 - **Efficient**: Bounded memory usage via LRU cache and idle file cleanup
+- Built-in language servers stay on by default, but can now be overridden or disabled via `lsp.servers`
 - Supports TypeScript/JavaScript, Vue, Svelte, Dart/Flutter, Python, Go, Kotlin, Swift, and Rust
 
 ## Supported Languages
@@ -121,7 +122,7 @@ lsp action=workspace-diagnostics files=["src/index.ts", "src/utils.ts"] severity
 ```
 
 Example questions the LLM can answer using this tool:
-- "Where is `handleSessionStart` defined in `lsp-hook.ts`?"
+- "Where is `handleSessionStart` defined in `lsp.ts`?"
 - "Find all references to `getManager`"
 - "What type does `getDefinition` return?"
 - "List symbols in `lsp-core.ts`"
@@ -132,11 +133,20 @@ Example questions the LLM can answer using this tool:
 
 ## Settings
 
+`pi-hooks` now reads LSP settings from both:
+
+- global Pi settings: `~/.pi/agent/settings.json`
+- project Pi settings: `<project>/.pi/settings.json`
+
+Project settings override global settings using a nested object merge, so you can keep a global default and tweak one repo locally without replacing the entire `lsp` block.
+
+### Hook mode
+
 Use `/lsp` to configure the auto diagnostics hook:
 - Mode: default at agent end; can run after each edit/write or be disabled
 - Scope: session-only or global (`~/.pi/agent/settings.json`)
 
-To disable auto diagnostics, choose "Disabled" in `/lsp` or set in `~/.pi/agent/settings.json`:
+To disable auto diagnostics, choose "Disabled" in `/lsp` or set:
 ```json
 {
   "lsp": {
@@ -147,6 +157,159 @@ To disable auto diagnostics, choose "Disabled" in `/lsp` or set in `~/.pi/agent/
 Other values: `"agent_end"` (default) and `"edit_write"`.
 
 Agent-end mode analyzes files touched during the full agent response (after all tool calls complete) and posts a diagnostics message only once. Disabling the hook does not disable the `/lsp` tool.
+
+### Server configuration
+
+Server overrides live under `lsp.servers`:
+
+```json
+{
+  "lsp": {
+    "hookMode": "agent_end",
+    "servers": {
+      "typescript": {
+        "command": ["tsgo", "lsp", "--stdio"]
+      },
+      "pyright": {
+        "disabled": true
+      },
+      "bash": {
+        "command": ["bash-language-server", "start"],
+        "extensions": [".sh", ".bash"],
+        "env": {
+          "SHELLCHECK_PATH": "~/.agents/bin/shellcheck-guard"
+        },
+        "initialization": {
+          "shell": "bash"
+        }
+      }
+    }
+  }
+}
+```
+
+Each server entry supports:
+
+```json
+{
+  "command": ["binary", "arg1", "arg2"],
+  "extensions": [".ext1", ".ext2"],
+  "env": {
+    "KEY": "value"
+  },
+  "initialization": {
+    "any": "json-compatible object"
+  },
+  "disabled": true
+}
+```
+
+### Override model
+
+Built-in server ids are:
+- `dart`
+- `typescript`
+- `vue`
+- `svelte`
+- `pyright`
+- `gopls`
+- `kotlin`
+- `swift`
+- `rust-analyzer`
+
+When a configured id matches a built-in server id, config overlays onto the built-in definition instead of replacing it outright.
+
+What config **can** override:
+- `command`
+- `extensions`
+- `env`
+- `initialization`
+- `disabled`
+
+What built-ins still keep for themselves in this release:
+- project root detection (`findRoot`)
+- special spawn behavior for servers like Dart, TypeScript, Kotlin, and Swift when `command` is not overridden
+
+Examples:
+
+- Override only the TypeScript command while keeping built-in file extensions and root detection:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "typescript": {
+        "command": ["tsgo", "lsp", "--stdio"]
+      }
+    }
+  }
+}
+```
+
+- Disable Pyright completely:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "pyright": {
+        "disabled": true
+      }
+    }
+  }
+}
+```
+
+- Add environment variables for a built-in server:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "typescript": {
+        "env": {
+          "TSS_LOG": "-level verbose"
+        }
+      }
+    }
+  }
+}
+```
+
+- Send initialization options to a built-in server:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "typescript": {
+        "initialization": {
+          "preferences": {
+            "includeCompletionsForModuleExports": true
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+- Define a brand new custom server:
+
+```json
+{
+  "lsp": {
+    "servers": {
+      "yaml-ls": {
+        "command": ["yaml-language-server", "--stdio"],
+        "extensions": [".yaml", ".yml"]
+      }
+    }
+  }
+}
+```
+
+Custom servers must declare both `command` and `extensions`. They use a generic root heuristic that looks upward for `.git`, `package.json`, `pyproject.toml`, `Cargo.toml`, or `go.mod`, then falls back to the file's directory.
 
 ## File Structure
 
@@ -169,8 +332,9 @@ npm run test:tool
 # Integration tests (spawns real language servers)
 npm run test:integration
 
-# Run rust-analyzer tests (slow, disabled by default)
-RUST_LSP_TEST=1 npm run test:integration
+# Tests are skipped automatically when the required language server binary
+# is not installed on your machine (for example `rust-analyzer`, `dart`,
+# `gopls`, `kotlin-language-server`, or `pyright-langserver`).
 ```
 
 ## License

@@ -35,7 +35,7 @@ Git-based checkpoint system for restoring code state when forking conversations.
 Language Server Protocol integration (hook + tool).
 
 The package exports two extensions via `package.json`:
-- `lsp-hook.ts` - Auto-diagnostics (default at agent end)
+- `lsp.ts` - Auto-diagnostics (default at agent end)
 - `lsp-tool.ts` - On-demand LSP queries
 
 **Hook** (auto-diagnostics):
@@ -44,6 +44,7 @@ The package exports two extensions via `package.json`:
 - Configure via `/lsp` to switch to per-edit or disabled
 - Supports web, Flutter, and common backend stacks
 - Manages LSP server lifecycles per project root
+- Supports OpenCode-style `lsp.servers` config overlays for overriding, disabling, or adding servers
 
 **Tool** (on-demand queries):
 - Definitions, references, hover, symbols, diagnostics, signatures

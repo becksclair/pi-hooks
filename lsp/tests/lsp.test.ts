@@ -14,7 +14,14 @@ import { mkdtemp, rm, writeFile, mkdir } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { pathToFileURL } from "url";
-import { LSP_SERVERS, LANGUAGE_IDS } from "../lsp-core.js";
+import {
+  LSP_SERVERS,
+  LANGUAGE_IDS,
+  getOrCreateManager,
+  parseLspSettings,
+  resolveLspConfig,
+  shutdownManager,
+} from "../lsp-core.js";
 
 // ============================================================================
 // Test utilities
@@ -67,6 +74,22 @@ async function withTempDir(
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+async function withTempHome(
+  structure: Record<string, string | null>, // null = directory, string = file content
+  fn: (dir: string) => Promise<void>
+): Promise<void> {
+  const originalHome = process.env.HOME;
+  await withTempDir(structure, async (dir) => {
+    process.env.HOME = dir;
+    try {
+      await fn(dir);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  });
 }
 
 // ============================================================================
@@ -168,6 +191,261 @@ test("LSP_SERVERS: has Pyright server", async () => {
   assert(server !== undefined, "Should have pyright server");
   assertIncludes(server!.extensions, ".py", "Should handle .py");
   assertIncludes(server!.extensions, ".pyi", "Should handle .pyi");
+});
+
+// ============================================================================
+// Config parsing and resolution tests
+// ============================================================================
+
+test("parseLspSettings: reads hookMode and server entries", async () => {
+  const parsed = parseLspSettings({
+    lsp: {
+      hookMode: "edit_write",
+      servers: {
+        typescript: { command: ["tsgo", "lsp", "--stdio"] },
+        bash: {
+          command: ["bash-language-server", "start"],
+          extensions: [".sh", ".bash"],
+          env: { SHELLCHECK_PATH: "~/.agents/bin/shellcheck-guard" },
+          initialization: { answer: 42 },
+        },
+      },
+    },
+  });
+
+  assertEquals(parsed.hookMode, "edit_write", "Should parse hookMode");
+  assertEquals(parsed.servers.typescript.command?.[0], "tsgo", "Should parse server command");
+  assertEquals(parsed.servers.bash.extensions?.[1], ".bash", "Should parse custom extensions");
+  assertEquals(parsed.invalidServerEntries.length, 0, "Should not record invalid entries");
+});
+
+test("parseLspSettings: skips invalid server entries", async () => {
+  const parsed = parseLspSettings({
+    lsp: {
+      servers: {
+        broken: { command: ["ok"], extensions: ["sh"] },
+        nope: "definitely cursed",
+      },
+    },
+  });
+
+  assertEquals(Object.keys(parsed.servers).length, 0, "Invalid servers should be skipped");
+  assertEquals(parsed.invalidServerEntries.length, 2, "Should record invalid entries");
+});
+
+test("resolveLspConfig: built-in override inherits extensions", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: { command: ["tsgo", "lsp", "--stdio"] },
+        },
+      },
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    const server = resolved.servers.find((item) => item.id === "typescript");
+    assert(server !== undefined, "Should keep builtin typescript server");
+    assertIncludes(server!.extensions, ".ts", "Should inherit built-in .ts extension");
+    assertEquals(server!.command?.[0], "tsgo", "Should use overridden command");
+  });
+});
+
+test("resolveLspConfig: project settings override global and preserve siblings", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        hookMode: "disabled",
+        servers: {
+          typescript: {
+            command: ["tsgo", "lsp", "--stdio"],
+            env: { GLOBAL_ONLY: "1", SHARED: "global" },
+          },
+        },
+      },
+    }),
+    ".pi/settings.json": JSON.stringify({
+      lsp: {
+        hookMode: "agent_end",
+        servers: {
+          typescript: {
+            initialization: { mode: "project" },
+            env: { SHARED: "project" },
+          },
+        },
+      },
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    const server = resolved.servers.find((item) => item.id === "typescript");
+    assertEquals(resolved.hookMode, "agent_end", "Project hook mode should win");
+    assertEquals(server?.command?.[0], "tsgo", "Should keep global command override");
+    assertEquals((server?.env || {}).GLOBAL_ONLY, "1", "Should keep global env keys");
+    assertEquals((server?.env || {}).SHARED, "project", "Project env should override overlapping keys");
+    assertEquals((server?.initialization as any)?.mode, "project", "Should merge in project initialization");
+  });
+});
+
+test("resolveLspConfig: malformed project lsp settings do not erase valid global config", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        hookMode: "edit_write",
+        servers: {
+          typescript: {
+            command: ["tsgo", "lsp", "--stdio"],
+          },
+        },
+      },
+    }),
+    ".pi/settings.json": JSON.stringify({
+      lsp: [],
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    const server = resolved.servers.find((item) => item.id === "typescript");
+
+    assertEquals(resolved.hookMode, "edit_write", "Malformed project hookMode should not wipe global hookMode");
+    assert(server !== undefined, "Valid global TypeScript override should survive malformed project lsp block");
+    assertEquals(server?.command?.[0], "tsgo", "Global TypeScript command should survive malformed project block");
+  });
+});
+
+test("resolveLspConfig: malformed project server override does not erase inherited server", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: {
+            command: ["tsgo", "lsp", "--stdio"],
+          },
+        },
+      },
+    }),
+    ".pi/settings.json": JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: {
+            extensions: ["ts"]
+          }
+        }
+      },
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    const server = resolved.servers.find((item) => item.id === "typescript");
+
+    assert(server !== undefined, "Malformed project override should not remove inherited TypeScript support");
+    assertEquals(server?.command?.[0], "tsgo", "Inherited command should survive malformed project override");
+    assertIncludes(server?.extensions || [], ".ts", "Inherited extensions should survive malformed project override");
+    assert(resolved.invalidServerEntries.some((item) => item.id === "typescript"), "Invalid project override should still be reported");
+  });
+});
+
+test("resolveLspConfig: project legacy hookEnabled overrides global hookMode", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        hookMode: "agent_end",
+      },
+    }),
+    ".pi/settings.json": JSON.stringify({
+      lsp: {
+        hookEnabled: false,
+      },
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    assertEquals(resolved.hookMode, "disabled", "Project hookEnabled should override global hookMode");
+  });
+});
+
+test("resolveLspConfig: disable built-in server", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        servers: {
+          pyright: { disabled: true },
+        },
+      },
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    const pyright = resolved.servers.find((item) => item.id === "pyright");
+    assertEquals(pyright, undefined, "Disabled built-in should be absent");
+  });
+});
+
+test("resolveLspConfig: custom server requires command and extensions", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        servers: {
+          yaml: { command: ["yaml-language-server", "--stdio"] },
+        },
+      },
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    const yaml = resolved.servers.find((item) => item.id === "yaml");
+    assertEquals(yaml, undefined, "Incomplete custom server should be skipped");
+    assert(resolved.invalidServerEntries.some((item) => item.id === "yaml"), "Should record why custom server was skipped");
+  });
+});
+
+test("resolveLspConfig: custom server keeps env and initialization", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        servers: {
+          bash: {
+            command: ["bash-language-server", "start"],
+            extensions: [".sh", ".bash"],
+            env: { SHELLCHECK_PATH: "~/.agents/bin/shellcheck-guard" },
+            initialization: { shell: "bash" },
+          },
+        },
+      },
+    }),
+  }, async (dir) => {
+    const resolved = resolveLspConfig(dir);
+    const bash = resolved.servers.find((item) => item.id === "bash");
+    assert(bash !== undefined, "Custom server should resolve");
+    assertEquals(bash?.extensions[0], ".sh", "Should keep custom extensions");
+    assertEquals((bash?.env || {}).SHELLCHECK_PATH, "~/.agents/bin/shellcheck-guard", "Should preserve env in resolved config");
+    assertEquals((bash?.initialization as any)?.shell, "bash", "Should preserve initialization in resolved config");
+  });
+});
+
+test("getOrCreateManager: refreshes when resolved config fingerprint changes", async () => {
+  await withTempHome({
+    ".pi/agent/settings.json": JSON.stringify({
+      lsp: {
+        servers: {
+          typescript: { command: ["typescript-language-server", "--stdio"] },
+        },
+      },
+    }),
+  }, async (dir) => {
+    try {
+      const first = getOrCreateManager(dir);
+      const firstFingerprint = first.configFingerprint;
+
+      await writeFile(join(dir, ".pi/settings.json"), JSON.stringify({
+        lsp: {
+          servers: {
+            typescript: { command: ["tsgo", "lsp", "--stdio"] },
+          },
+        },
+      }));
+
+      const second = getOrCreateManager(dir);
+      assert(first !== second, "Manager should rebuild when config changes");
+      assert(firstFingerprint !== second.configFingerprint, "Fingerprint should change with resolved config");
+    } finally {
+      await shutdownManager();
+    }
+  });
 });
 
 // ============================================================================

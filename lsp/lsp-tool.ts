@@ -6,16 +6,25 @@
  * - document symbols, diagnostics, workspace diagnostics
  * - rename, code actions
  *
- * Supported languages:
+ * Supported languages (built-in + configurable via lsp.servers in settings.json):
  *   - Dart/Flutter (dart language-server)
- *   - TypeScript/JavaScript (typescript-language-server)
+ *   - TypeScript/JavaScript (tsgo or typescript-language-server)
  *   - Vue (vue-language-server)
  *   - Svelte (svelteserver)
- *   - Python (pyright-langserver)
+ *   - Python (basedpyright / pyright-langserver, ruff)
  *   - Go (gopls)
- *   - Kotlin (kotlin-ls)
+ *   - Kotlin (kotlin-lsp)
  *   - Swift (sourcekit-lsp)
  *   - Rust (rust-analyzer)
+ *   - Bash/Shell (bash-language-server)
+ *   - Fish (fish-lsp)
+ *   - Nushell (nu --lsp)
+ *   - Nim (nimlangserver)
+ *   - JSON/JSONC (vscode-json-language-server)
+ *   - Markdown/MDX (remark-language-server, mdx-language-server)
+ *   - YAML (yaml-language-server)
+ *   - Tailwind CSS (@tailwindcss/language-server)
+ *   - Linting (oxlint)
  *
  * Usage:
  *   pi --extension ./lsp-tool.ts
