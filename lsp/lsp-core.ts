@@ -893,11 +893,16 @@ export async function shutdownManager(): Promise<void> {
   await manager.shutdown();
 }
 
+const MAX_CRASH_RESTARTS = 3;
+const RESTART_BACKOFF_MS = 1000;
+
 export class LSPManager {
   private clients = new Map<string, LSPClient>();
   private spawning = new Map<string, Promise<LSPClient | undefined>>();
   private broken = new Set<string>();
+  private crashCounts = new Map<string, number>();
   private cleanupTimer: NodeJS.Timeout | null = null;
+  private shuttingDown = false;
 
   constructor(
     private cwd: string,
@@ -939,6 +944,25 @@ export class LSPManager {
       if (!oldest || state.lastAccess < oldest.time) oldest = { path: fp, time: state.lastAccess };
     }
     if (oldest) this.closeFile(client, oldest.path);
+  }
+
+  private scheduleRestart(config: ResolvedServerDefinition, root: string, k: string) {
+    const count = (this.crashCounts.get(k) ?? 0) + 1;
+    this.crashCounts.set(k, count);
+    if (count > MAX_CRASH_RESTARTS) {
+      this.broken.add(k);
+      return;
+    }
+    const delay = RESTART_BACKOFF_MS * count;
+    setTimeout(() => {
+      if (this.shuttingDown || this.broken.has(k) || this.clients.has(k) || this.spawning.has(k)) return;
+      const pending = this.initClient(config, root).then((client) => {
+        if (client) this.clients.set(k, client);
+        return client;
+      });
+      this.spawning.set(k, pending);
+      pending.finally(() => this.spawning.delete(k));
+    }, delay);
   }
 
   private key(id: string, root: string) {
@@ -1021,11 +1045,12 @@ export class LSPManager {
       handle.process.on("exit", () => {
         client.closed = true;
         this.clients.delete(k);
+        this.scheduleRestart(config, root, k);
       });
       handle.process.on("error", () => {
         client.closed = true;
         this.clients.delete(k);
-        this.broken.add(k);
+        this.scheduleRestart(config, root, k);
       });
 
       conn.listen();
@@ -1049,10 +1074,11 @@ export class LSPManager {
 
       client.capabilities = (initResult as { capabilities?: unknown } | undefined)?.capabilities;
 
-      conn.sendNotification(InitializedNotification.type, {});
+      conn.sendNotification(InitializedNotification.type, {}).catch(() => {});
       if (handle.initOptions) {
-        conn.sendNotification("workspace/didChangeConfiguration", { settings: handle.initOptions });
+        conn.sendNotification("workspace/didChangeConfiguration", { settings: handle.initOptions }).catch(() => {});
       }
+      this.crashCounts.delete(k);
       return client;
     } catch {
       this.broken.add(k);
@@ -1559,6 +1585,7 @@ export class LSPManager {
   }
 
   async shutdown() {
+    this.shuttingDown = true;
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
