@@ -869,6 +869,24 @@ let sharedManager: LSPManager | null = null;
 let managerCwd: string | null = null;
 let managerFingerprint: string | null = null;
 
+/**
+ * Module-level tracking of all spawned LSP child process PIDs.
+ *
+ * The graceful `shutdownManager()` path (via session_shutdown) sends LSP
+ * shutdown/exit and removes PIDs from this set.  The `process.on('exit')`
+ * handler below is the safety net for ungraceful exits — crashes, signals
+ * that skip session_shutdown, etc.  It fires synchronously so only SIGKILL
+ * is useful here (no event loop tick for the child to handle SIGTERM).
+ */
+const trackedChildPids = new Set<number>();
+
+process.on("exit", () => {
+  for (const pid of trackedChildPids) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
+  }
+  trackedChildPids.clear();
+});
+
 export function getOrCreateManager(cwd: string): LSPManager {
   const resolvedConfig = resolveLspConfig(cwd);
   if (!sharedManager || managerCwd !== cwd || managerFingerprint !== resolvedConfig.fingerprint) {
@@ -978,6 +996,9 @@ export class LSPManager {
         return undefined;
       }
 
+      // Track the child PID for cleanup on unexpected parent exit.
+      if (handle.process.pid != null) trackedChildPids.add(handle.process.pid);
+
       const reader = new StreamMessageReader(handle.process.stdout);
       const writer = new StreamMessageWriter(handle.process.stdin);
       const conn = createMessageConnection(reader, writer);
@@ -1043,11 +1064,13 @@ export class LSPManager {
       conn.onRequest("workspace/workspaceFolders", () => [{ name: "workspace", uri: pathToFileURL(root).href }]);
 
       handle.process.on("exit", () => {
+        if (handle.process.pid != null) trackedChildPids.delete(handle.process.pid);
         client.closed = true;
         this.clients.delete(k);
         this.scheduleRestart(config, root, k);
       });
       handle.process.on("error", () => {
+        if (handle.process.pid != null) trackedChildPids.delete(handle.process.pid);
         client.closed = true;
         this.clients.delete(k);
         this.scheduleRestart(config, root, k);
@@ -1621,6 +1644,7 @@ export class LSPManager {
       try {
         client.process.kill();
       } catch {}
+      if (client.process.pid != null) trackedChildPids.delete(client.process.pid);
     }
   }
 }
